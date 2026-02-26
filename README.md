@@ -40,9 +40,9 @@ height %d latency is %f batch is %d
 - 负载模拟在 proposal 校验后、投票前执行，`nums` 每个高度重置。
 
 
-## Windows 一键启动脚本
+## Windows 一键启动脚本（BAT）
 
-新增 `scripts/start_cluster.ps1`，支持“脚本名 + 算法名 + 节点数”自动执行：
+使用仓库根目录下的 `start_cluster.cmd`，支持“脚本名 + 算法名 + 节点数”自动执行：
 
 1. 运行 `genkey` 生成签名材料与 `cluster:config`
 2. 打开一个新终端运行 `client`
@@ -50,17 +50,17 @@ height %d latency is %f batch is %d
 
 ### 用法
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 pbft 4
-powershell -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 hotstuff 7
-powershell -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 fast-hotstuff 4
-powershell -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 hpbft 10
+```bat
+.\start_cluster.cmd pbft 4
+.\start_cluster.cmd hotstuff 7
+.\start_cluster.cmd fast-hotstuff 4
+.\start_cluster.cmd hpbft 10
 ```
 
 ### 参数
 
 - 第 1 个参数：算法名，必须为 `pbft | hotstuff | fast-hotstuff | hpbft`
-- 第 2 个参数：节点数 `N`
+- 第 2 个参数：节点数 `N`（正整数）
 
 ### 前置条件
 
@@ -68,21 +68,4 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 hpbft 10
 - 已安装 Redis 客户端（`redis-cli` 在 PATH）
 - 本机可访问 Redis（默认 `127.0.0.1:6379`）
 
-
-### 推荐启动方式（避免脚本签名限制）
-
-如果你的 Windows PowerShell 提示脚本未签名（`PSSecurityException`），优先使用仓库根目录下的 `start_cluster.cmd`：
-
-```bat
-.\start_cluster.cmd pbft 4
-```
-
-该命令会在内部使用 `-ExecutionPolicy Bypass` 调用 `scripts\start_cluster.ps1`，避免当前会话被执行策略阻止。
-
-### 直接运行 ps1（可选）
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 pbft 4
-```
-
-如果你必须直接 `./scripts/start_cluster.ps1` 启动，请先调整策略或解锁文件（例如 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` 或 `Unblock-File`）。
+> 说明：已改为纯 BAT 启动，不再依赖 PowerShell 脚本签名策略。
