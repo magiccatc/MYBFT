@@ -67,3 +67,22 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 hpbft 10
 - 已安装 Go（`go` 在 PATH）
 - 已安装 Redis 客户端（`redis-cli` 在 PATH）
 - 本机可访问 Redis（默认 `127.0.0.1:6379`）
+
+
+### 推荐启动方式（避免脚本签名限制）
+
+如果你的 Windows PowerShell 提示脚本未签名（`PSSecurityException`），优先使用仓库根目录下的 `start_cluster.cmd`：
+
+```bat
+.\start_cluster.cmd pbft 4
+```
+
+该命令会在内部使用 `-ExecutionPolicy Bypass` 调用 `scripts\start_cluster.ps1`，避免当前会话被执行策略阻止。
+
+### 直接运行 ps1（可选）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_cluster.ps1 pbft 4
+```
+
+如果你必须直接 `./scripts/start_cluster.ps1` 启动，请先调整策略或解锁文件（例如 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` 或 `Unblock-File`）。
