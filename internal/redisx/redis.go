@@ -40,6 +40,16 @@ func (c *Client) HSet(key string, fields map[string]string) error {
 }
 
 func (c *Client) HGet(key, field string) (string, error) { return c.cmd("HGET", key, field) }
+
+func (c *Client) HDel(key string, fields ...string) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	args := []string{"HDEL", key}
+	args = append(args, fields...)
+	_, err := c.cmd(args...)
+	return err
+}
 func (c *Client) HExists(key, field string) (bool, error) {
 	v, err := c.cmd("HEXISTS", key, field)
 	return v == "1", err

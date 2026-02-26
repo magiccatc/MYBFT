@@ -233,7 +233,6 @@ func (s *Service) proposeCurrentHeight() {
 		msg = common.ConsensusMessage{Type: "HPProposal", View: view, Height: height, From: s.selfID, Digest: digest, Tx: tx}
 	}
 	s.broadcast(msg)
-	s.process(msg)
 }
 
 func (s *Service) callStart(height, view int) {
@@ -264,7 +263,6 @@ func (s *Service) sendPrepare(digest string) {
 	sig := crypto.Sign(s.keys[s.selfID], m)
 	msg := common.ConsensusMessage{Type: "Prepare", View: s.view, Height: s.height, From: s.selfID, Digest: digest, SigShare: sig}
 	s.broadcast(msg)
-	s.process(msg)
 }
 
 func (s *Service) sendCommit(digest string) {
@@ -272,14 +270,10 @@ func (s *Service) sendCommit(digest string) {
 	sig := crypto.Sign(s.keys[s.selfID], m)
 	msg := common.ConsensusMessage{Type: "Commit", View: s.view, Height: s.height, From: s.selfID, Digest: digest, SigShare: sig}
 	s.broadcast(msg)
-	s.process(msg)
 }
 
 func (s *Service) broadcast(msg common.ConsensusMessage) {
 	for i := 1; i <= s.cfg.N; i++ {
-		if i == s.selfID {
-			continue
-		}
 		s.sendTo(i, msg)
 	}
 }
