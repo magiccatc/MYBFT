@@ -37,6 +37,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
+where redis-server >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] command not found: redis-server
+  exit /b 1
+)
+
 set "REPO_ROOT=%~dp0"
 if "%REPO_ROOT:~-1%"=="\" set "REPO_ROOT=%REPO_ROOT:~0,-1%"
 
@@ -44,6 +50,20 @@ pushd "%REPO_ROOT%" >nul
 if errorlevel 1 (
   echo [ERROR] cannot enter repo root: %REPO_ROOT%
   exit /b 1
+)
+
+echo [0/3] checking redis on 127.0.0.1:6379
+redis-cli -h 127.0.0.1 -p 6379 ping >nul 2>nul
+if errorlevel 1 (
+  echo [0/3] redis not running, starting redis-server in new terminal...
+  start "MYBFT-redis" cmd /k "redis-server"
+  ping -n 3 127.0.0.1 >nul
+  redis-cli -h 127.0.0.1 -p 6379 ping >nul 2>nul
+  if errorlevel 1 (
+    echo [ERROR] redis-server failed to start or port 6379 is unreachable.
+    popd >nul
+    exit /b 1
+  )
 )
 
 echo [1/3] generating keys and cluster config: N=%NODE_COUNT%

@@ -66,6 +66,8 @@ height %d latency is %f batch is %d
 
 - 已安装 Go（`go` 在 PATH）
 - 已安装 Redis 客户端（`redis-cli` 在 PATH）
+- 已安装 Redis 服务端（`redis-server` 在 PATH）
 - 本机可访问 Redis（默认 `127.0.0.1:6379`）
 
 > 说明：已改为纯 BAT 启动，不再依赖 PowerShell 脚本签名策略。
+> 脚本会先检测 Redis；若未运行，会自动打开新终端执行 `redis-server`。
