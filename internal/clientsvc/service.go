@@ -44,7 +44,9 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		s.rdb.HSet("latency:start", map[string]string{h: strconv.FormatInt(now, 10)})
 		s.rdb.HSet("latency:reply", map[string]string{h: "0"})
 		s.rdb.Del("latency:dedup:" + h)
-		log.Printf("ts=%d role=client id=0 event=start_recorded height=%d", now, req.Height)
+		s.rdb.HDel("latency:end", h)
+		s.rdb.HDel("latency:printed", h)
+		log.Printf("ts=%d role=client id=0 event=start_recorded height=%d reset=end,printed", now, req.Height)
 	} else if req.Height == s.currentHeight {
 		log.Printf("ts=%d role=client id=0 event=duplicate_start_ignored height=%d", now, req.Height)
 	} else {
