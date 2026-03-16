@@ -3,19 +3,25 @@ package nodesvc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	goleveldb "github.com/syndtr/goleveldb/leveldb"
+
 	"mybft/internal/common"
 	"mybft/internal/crypto"
 	"mybft/internal/redisx"
+	"mybft/internal/storage"
+	leveldbstore "mybft/internal/storage/leveldb"
 )
 
 type heightState struct {
@@ -28,28 +34,64 @@ type heightState struct {
 	Done           bool
 }
 
-type Service struct {
-	mu         sync.Mutex
-	rdb        *redisx.Client
-	selfID     int
-	alg        string
-	cfg        redisx.ClusterConfig
-	th         common.Thresholds
-	height     int
-	view       int
-	leaderMode bool
-	keys       map[int]string
-	peerAddrs  map[int]string
-	clientURL  string
-	state      map[int]*heightState
+type hotstuffBlock struct {
+	Block     common.Block
+	QC        *common.QuorumCert
+	Committed bool
+	Executed  bool
 }
 
+type Service struct {
+	mu               sync.Mutex
+	rdb              *redisx.Client
+	selfID           int
+	alg              string
+	cfg              redisx.ClusterConfig
+	th               common.Thresholds
+	height           int
+	view             int
+	leaderMode       bool
+	keys             map[int]string
+	peerAddrs        map[int]string
+	clientURL        string
+	state            map[int]*heightState
+	stores           *leveldbstore.NodeStores
+	hotstuffBlocks   map[string]*hotstuffBlock
+	hotstuffHighQC   common.QuorumCert
+	hotstuffLockedQC common.QuorumCert
+	hotstuffVoted    map[int]string
+}
+
+// 初始化节点服务：加载集群配置、密钥与同伴地址。
 func New(rdb *redisx.Client, selfID int, alg string) (*Service, error) {
 	cfg, err := redisx.ReadClusterConfig(rdb)
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{rdb: rdb, selfID: selfID, alg: alg, cfg: cfg, th: common.CalcThresholds(cfg.N), height: 1, view: 1, keys: map[int]string{}, peerAddrs: map[int]string{}, state: map[int]*heightState{}, clientURL: "http://" + cfg.ClientAddr}
+	dataRoot := os.Getenv("MYBFT_DATA_DIR")
+	if dataRoot == "" {
+		dataRoot = "data"
+	}
+	stores, err := leveldbstore.OpenNodeStores(dataRoot, selfID)
+	if err != nil {
+		return nil, fmt.Errorf("open node stores: %w", err)
+	}
+	s := &Service{
+		rdb:            rdb,
+		selfID:         selfID,
+		alg:            alg,
+		cfg:            cfg,
+		th:             common.CalcThresholds(cfg.N),
+		height:         1,
+		view:           1,
+		keys:           map[int]string{},
+		peerAddrs:      map[int]string{},
+		state:          map[int]*heightState{},
+		clientURL:      "http://" + cfg.ClientAddr,
+		stores:         stores,
+		hotstuffBlocks: map[string]*hotstuffBlock{},
+		hotstuffVoted:  map[int]string{},
+	}
 	for i := 1; i <= cfg.N; i++ {
 		sk, err := rdb.HGet(fmt.Sprintf("Node:%d", i), "threshold_sk")
 		if err != nil {
@@ -58,18 +100,21 @@ func New(rdb *redisx.Client, selfID int, alg string) (*Service, error) {
 		s.keys[i] = sk
 		s.peerAddrs[i] = fmt.Sprintf("127.0.0.1:%d", cfg.BasePort+i)
 	}
+	s.initHotStuffState()
+	s.loadPersistedPosition()
+	s.loadPersistedHotStuffState()
+	s.persistPosition()
 	s.leaderMode = s.isLeader(s.view)
 	return s, nil
 }
 
+// 判断当前节点在指定 view 下是否为 leader。
 func (s *Service) isLeader(view int) bool {
-	if s.alg == "pbft" {
-		return s.selfID == 1
-	}
 	leader := ((view - 1) % s.cfg.N) + 1
 	return s.selfID == leader
 }
 
+// 若当前为 leader，延迟后触发首轮提案。
 func (s *Service) StartIfLeader() {
 	go func() {
 		time.Sleep(600 * time.Millisecond)
@@ -82,6 +127,7 @@ func (s *Service) StartIfLeader() {
 	}()
 }
 
+// 节点消息入口：解码共识消息并进入流程处理。
 func (s *Service) HandleMessage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -96,6 +142,7 @@ func (s *Service) HandleMessage(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// 统一入口：按算法分发到 SBFT 或 HotStuff 系列处理逻辑。
 func (s *Service) process(msg common.ConsensusMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,10 +157,10 @@ func (s *Service) process(msg common.ConsensusMessage) {
 	hs.Dedup[dk] = struct{}{}
 
 	switch s.alg {
-	case "pbft":
-		s.processPBFT(msg, hs)
+	case "sbft":
+		s.processSBFT(msg, hs)
 	case "hotstuff":
-		s.processOneVote(msg, hs, "HSProposal", "HSVote", "HSQC")
+		s.processHotStuff(msg, hs)
 	case "fast-hotstuff":
 		s.processOneVote(msg, hs, "FHSProposal", "FHSVote", "FHSCommitQC")
 	case "hpbft":
@@ -121,7 +168,8 @@ func (s *Service) process(msg common.ConsensusMessage) {
 	}
 }
 
-func (s *Service) processPBFT(msg common.ConsensusMessage, hs *heightState) {
+// SBFT 简化流程：PrePrepare -> Prepare(回 leader) -> CommitProof(广播)。
+func (s *Service) processSBFT(msg common.ConsensusMessage, hs *heightState) {
 	switch msg.Type {
 	case "PrePrepare":
 		if common.Digest(msg.View, msg.Height, msg.Tx) != msg.Digest {
@@ -129,39 +177,140 @@ func (s *Service) processPBFT(msg common.ConsensusMessage, hs *heightState) {
 		}
 		hs.ProposalDigest = msg.Digest
 		hs.ProposalTx = msg.Tx
+		s.persistProposal(msg)
 		s.executeLoad(msg.Tx)
-		s.sendPrepare(msg.Digest)
+		m := crypto.VoteMessage("Prepare", msg.View, msg.Height, msg.Digest, s.selfID)
+		sig := crypto.Sign(s.keys[s.selfID], m)
+		s.persistVote(msg.View, msg.Digest)
+		share := common.ConsensusMessage{Type: "Prepare", View: msg.View, Height: msg.Height, From: s.selfID, Digest: msg.Digest, SigShare: sig}
+		s.sendTo(s.leaderID(msg.View), share)
 	case "Prepare":
+		if !s.isLeader(msg.View) {
+			return
+		}
 		m := crypto.VoteMessage("Prepare", msg.View, msg.Height, msg.Digest, msg.From)
 		if !crypto.Verify(s.keys[msg.From], m, msg.SigShare) {
 			return
 		}
 		hs.Prepared[msg.From] = msg.SigShare
-		if len(hs.Prepared) >= s.th.T {
-			s.sendCommit(msg.Digest)
-		}
-	case "Commit":
-		m := crypto.VoteMessage("Commit", msg.View, msg.Height, msg.Digest, msg.From)
-		if !crypto.Verify(s.keys[msg.From], m, msg.SigShare) {
-			return
-		}
-		hs.Committed[msg.From] = msg.SigShare
-		if len(hs.Committed) >= s.th.T && !hs.Done {
-			shares := make([]string, 0, len(hs.Committed))
-			for _, sig := range hs.Committed {
+		s.persistPrepare(msg)
+		if len(hs.Prepared) >= s.th.T && !hs.Done {
+			shares := make([]string, 0, len(hs.Prepared))
+			for _, sig := range hs.Prepared {
 				shares = append(shares, sig)
 			}
-			full := crypto.Aggregate(shares)
-			if !crypto.VerifyAggregate(shares, full) {
+			proof := crypto.Aggregate(shares)
+			if !crypto.VerifyAggregate(shares, proof) {
 				return
 			}
+			commitProof := common.ConsensusMessage{Type: "CommitProof", View: msg.View, Height: msg.Height, From: s.selfID, Digest: msg.Digest, QC: proof}
 			hs.Done = true
+			s.persistQC(commitProof)
+			s.persistCommittedBlock(commitProof.Digest)
+			s.broadcast(commitProof)
 			go s.reportEnd(msg.Height)
 			go s.advanceHeight()
 		}
+	case "CommitProof":
+		if hs.Done || msg.QC == "" {
+			return
+		}
+		hs.Done = true
+		s.persistQC(msg)
+		s.persistCommittedBlock(msg.Digest)
+		go s.reportEnd(msg.Height)
+		go s.advanceHeight()
 	}
 }
 
+// HotStuff 链式流程：proposal 携带 parent/highQC，三链形成后提交祖先块。
+func (s *Service) processHotStuff(msg common.ConsensusMessage, hs *heightState) {
+	switch msg.Type {
+	case "HSProposal":
+		block := common.Block{
+			BlockID:        s.messageBlockID(msg),
+			ParentBlockID:  msg.ParentID,
+			JustifyBlockID: msg.JustifyID,
+			JustifyView:    msg.JustifyView,
+			Digest:         msg.Digest,
+			View:           msg.View,
+			Height:         msg.Height,
+			Proposer:       msg.From,
+			Tx:             append([]string(nil), msg.Tx...),
+		}
+		if !s.validateHotStuffProposal(block, msg) {
+			return
+		}
+		s.registerHotStuffBlock(block)
+		s.persistProposal(msg)
+		s.updateLockedQCFromProposal(block, msg)
+		if votedBlock, ok := s.hotstuffVoted[msg.View]; ok && votedBlock != block.BlockID {
+			return
+		}
+		m := crypto.VoteMessage("HSVote", msg.View, msg.Height, block.BlockID, s.selfID)
+		sig := crypto.Sign(s.keys[s.selfID], m)
+		s.hotstuffVoted[msg.View] = block.BlockID
+		s.persistVote(msg.View, block.BlockID)
+		vote := common.ConsensusMessage{
+			Type:     "HSVote",
+			View:     msg.View,
+			Height:   msg.Height,
+			From:     s.selfID,
+			BlockID:  block.BlockID,
+			Digest:   block.BlockID,
+			SigShare: sig,
+		}
+		s.sendTo(s.leaderID(msg.View), vote)
+	case "HSVote":
+		if !s.isLeader(msg.View) {
+			return
+		}
+		blockID := s.messageBlockID(msg)
+		m := crypto.VoteMessage("HSVote", msg.View, msg.Height, blockID, msg.From)
+		if !crypto.Verify(s.keys[msg.From], m, msg.SigShare) {
+			return
+		}
+		hs.Voted[msg.From] = msg.SigShare
+		if len(hs.Voted) >= s.th.T && !hs.Done {
+			shares := make([]string, 0, len(hs.Voted))
+			for _, sig := range hs.Voted {
+				shares = append(shares, sig)
+			}
+			qc := crypto.Aggregate(shares)
+			qcMsg := common.ConsensusMessage{
+				Type:    "HSQC",
+				View:    msg.View,
+				Height:  msg.Height,
+				From:    s.selfID,
+				BlockID: blockID,
+				Digest:  blockID,
+				QC:      qc,
+			}
+			hs.Done = true
+			s.persistQC(qcMsg)
+			s.updateHotStuffHighQC(qcMsg)
+			s.persistHighQC(qcMsg)
+			s.commitHotStuffAncestor(blockID)
+			s.broadcast(qcMsg)
+			go s.advanceHeight()
+		}
+	case "HSQC":
+		if hs.Done {
+			return
+		}
+		if s.messageBlockID(msg) == "" || msg.QC == "" {
+			return
+		}
+		hs.Done = true
+		s.persistQC(msg)
+		s.updateHotStuffHighQC(msg)
+		s.persistHighQC(msg)
+		s.commitHotStuffAncestor(s.messageBlockID(msg))
+		go s.advanceHeight()
+	}
+}
+
+// Fast-HotStuff/HPBFT 的单轮提案-投票-形成 QC 的简化闭环。
 func (s *Service) processOneVote(msg common.ConsensusMessage, hs *heightState, proposalType, voteType, qcType string) {
 	switch msg.Type {
 	case proposalType:
@@ -170,9 +319,11 @@ func (s *Service) processOneVote(msg common.ConsensusMessage, hs *heightState, p
 		}
 		hs.ProposalDigest = msg.Digest
 		hs.ProposalTx = msg.Tx
+		s.persistProposal(msg)
 		s.executeLoad(msg.Tx)
 		m := crypto.VoteMessage(voteType, msg.View, msg.Height, msg.Digest, s.selfID)
 		sig := crypto.Sign(s.keys[s.selfID], m)
+		s.persistVote(msg.View, msg.Digest)
 		vote := common.ConsensusMessage{Type: voteType, View: msg.View, Height: msg.Height, From: s.selfID, Digest: msg.Digest, SigShare: sig}
 		s.sendTo(s.leaderID(msg.View), vote)
 	case voteType:
@@ -192,6 +343,9 @@ func (s *Service) processOneVote(msg common.ConsensusMessage, hs *heightState, p
 			qc := crypto.Aggregate(shares)
 			qcMsg := common.ConsensusMessage{Type: qcType, View: msg.View, Height: msg.Height, From: s.selfID, Digest: msg.Digest, QC: qc}
 			hs.Done = true
+			s.persistQC(qcMsg)
+			s.persistHighQC(qcMsg)
+			s.persistCommittedBlock(qcMsg.Digest)
 			s.broadcast(qcMsg)
 			go s.reportEnd(msg.Height)
 			go s.advanceHeight()
@@ -201,32 +355,59 @@ func (s *Service) processOneVote(msg common.ConsensusMessage, hs *heightState, p
 			return
 		}
 		hs.Done = true
+		s.persistQC(msg)
+		s.persistHighQC(msg)
+		s.persistCommittedBlock(msg.Digest)
 		go s.reportEnd(msg.Height)
 		go s.advanceHeight()
 	}
 }
 
+// 计算给定 view 的 leader ID。
 func (s *Service) leaderID(view int) int {
-	if s.alg == "pbft" {
-		return 1
-	}
 	return ((view - 1) % s.cfg.N) + 1
 }
 
+// 生成当前高度的提案并广播。
 func (s *Service) proposeCurrentHeight() {
 	s.mu.Lock()
 	height := s.height
 	view := s.view
+	highQC := s.hotstuffHighQC
 	s.mu.Unlock()
 	tx := generateTx(height)
 	digest := common.Digest(view, height, tx)
 	s.callStart(height, view)
 	var msg common.ConsensusMessage
 	switch s.alg {
-	case "pbft":
+	case "sbft":
 		msg = common.ConsensusMessage{Type: "PrePrepare", View: view, Height: height, From: s.selfID, Digest: digest, Tx: tx}
 	case "hotstuff":
-		msg = common.ConsensusMessage{Type: "HSProposal", View: view, Height: height, From: s.selfID, Digest: digest, Tx: tx}
+		msg = common.ConsensusMessage{
+			Type:        "HSProposal",
+			View:        view,
+			Height:      height,
+			From:        s.selfID,
+			BlockID:     digest,
+			ParentID:    highQC.BlockID,
+			JustifyID:   highQC.BlockID,
+			JustifyQC:   highQC.QC,
+			JustifyView: highQC.View,
+			Digest:      digest,
+			Tx:          tx,
+		}
+		s.registerHotStuffBlock(common.Block{
+			BlockID:        digest,
+			ParentBlockID:  highQC.BlockID,
+			JustifyBlockID: highQC.BlockID,
+			JustifyView:    highQC.View,
+			Digest:         digest,
+			View:           view,
+			Height:         height,
+			Proposer:       s.selfID,
+			Tx:             append([]string(nil), tx...),
+		})
+		s.persistProposal(msg)
 	case "fast-hotstuff":
 		msg = common.ConsensusMessage{Type: "FHSProposal", View: view, Height: height, From: s.selfID, Digest: digest, Tx: tx}
 	case "hpbft":
@@ -235,16 +416,19 @@ func (s *Service) proposeCurrentHeight() {
 	s.broadcast(msg)
 }
 
+// 向 client 上报 /start（记录延迟起点）。
 func (s *Service) callStart(height, view int) {
 	body, _ := json.Marshal(common.StartRequest{Height: height, View: view, Start: time.Now().UnixNano()})
 	_, _ = http.Post(s.clientURL+"/start", "application/json", bytes.NewReader(body))
 }
 
+// 向 client 上报 /end（记录延迟终点）。
 func (s *Service) reportEnd(height int) {
 	body, _ := json.Marshal(common.EndRequest{Height: height, From: s.selfID, End: time.Now().UnixNano(), View: s.view})
 	_, _ = http.Post(s.clientURL+"/end", "application/json", bytes.NewReader(body))
 }
 
+// 推进高度与 view，并在成为 leader 时触发下一轮提案。
 func (s *Service) advanceHeight() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -253,37 +437,31 @@ func (s *Service) advanceHeight() {
 	}
 	s.height++
 	s.view = s.height
+	s.persistPosition()
 	if s.isLeader(s.view) {
-		go s.proposeCurrentHeight()
+		go func(alg string) {
+			if alg == "hotstuff" {
+				time.Sleep(80 * time.Millisecond)
+			}
+			s.proposeCurrentHeight()
+		}(s.alg)
 	}
 }
 
-func (s *Service) sendPrepare(digest string) {
-	m := crypto.VoteMessage("Prepare", s.view, s.height, digest, s.selfID)
-	sig := crypto.Sign(s.keys[s.selfID], m)
-	msg := common.ConsensusMessage{Type: "Prepare", View: s.view, Height: s.height, From: s.selfID, Digest: digest, SigShare: sig}
-	s.broadcast(msg)
-}
-
-func (s *Service) sendCommit(digest string) {
-	m := crypto.VoteMessage("Commit", s.view, s.height, digest, s.selfID)
-	sig := crypto.Sign(s.keys[s.selfID], m)
-	msg := common.ConsensusMessage{Type: "Commit", View: s.view, Height: s.height, From: s.selfID, Digest: digest, SigShare: sig}
-	s.broadcast(msg)
-}
-
+// 向所有节点广播共识消息。
 func (s *Service) broadcast(msg common.ConsensusMessage) {
 	for i := 1; i <= s.cfg.N; i++ {
 		s.sendTo(i, msg)
 	}
 }
 
+// 发送消息到指定节点，按算法路由到对应 HTTP 路径。
 func (s *Service) sendTo(id int, msg common.ConsensusMessage) {
 	addr := s.peerAddrs[id]
 	var prefix string
 	switch s.alg {
-	case "pbft":
-		prefix = "/pbft/message"
+	case "sbft":
+		prefix = "/sbft/message"
 	case "hotstuff":
 		prefix = "/hotstuff/message"
 	case "fast-hotstuff":
@@ -302,6 +480,7 @@ func (s *Service) sendTo(id int, msg common.ConsensusMessage) {
 	}()
 }
 
+// 获取或初始化指定高度的状态缓存。
 func (s *Service) getHeightState(height int) *heightState {
 	hs, ok := s.state[height]
 	if !ok {
@@ -311,6 +490,313 @@ func (s *Service) getHeightState(height int) *heightState {
 	return hs
 }
 
+func (s *Service) initHotStuffState() {
+	genesis := common.Block{
+		BlockID:  "genesis",
+		Digest:   "genesis",
+		View:     0,
+		Height:   0,
+		Proposer: 0,
+	}
+	s.hotstuffBlocks[genesis.BlockID] = &hotstuffBlock{Block: genesis, Committed: true, Executed: true}
+	s.hotstuffHighQC = common.QuorumCert{Type: "GenesisQC", BlockID: genesis.BlockID, View: 0, Height: 0, QC: "genesis-qc"}
+	s.hotstuffLockedQC = s.hotstuffHighQC
+}
+
+func (s *Service) loadPersistedHotStuffState() {
+	if s.stores == nil || s.alg != "hotstuff" {
+		return
+	}
+	if qc, err := s.stores.State.LoadHighQC(); err == nil && qc.BlockID != "" {
+		s.hotstuffHighQC = common.QuorumCert{Type: qc.QCType, BlockID: qc.BlockID, View: qc.View, Height: qc.Height, QC: qc.QC}
+	} else if err != nil && !errors.Is(err, goleveldb.ErrNotFound) {
+		log.Printf("node=%d load high qc: %v", s.selfID, err)
+	}
+	if qc, err := s.stores.State.LoadLockedQC(); err == nil && qc.BlockID != "" {
+		s.hotstuffLockedQC = common.QuorumCert{Type: qc.QCType, BlockID: qc.BlockID, View: qc.View, Height: qc.Height, QC: qc.QC}
+	} else if err != nil && !errors.Is(err, goleveldb.ErrNotFound) {
+		log.Printf("node=%d load locked qc: %v", s.selfID, err)
+	}
+}
+
+func (s *Service) messageBlockID(msg common.ConsensusMessage) string {
+	if msg.BlockID != "" {
+		return msg.BlockID
+	}
+	return msg.Digest
+}
+
+func (s *Service) registerHotStuffBlock(block common.Block) {
+	if block.BlockID == "" {
+		return
+	}
+	existing, ok := s.hotstuffBlocks[block.BlockID]
+	if ok {
+		if existing.Block.ParentBlockID == "" && block.ParentBlockID != "" {
+			existing.Block.ParentBlockID = block.ParentBlockID
+		}
+		if existing.Block.JustifyBlockID == "" && block.JustifyBlockID != "" {
+			existing.Block.JustifyBlockID = block.JustifyBlockID
+		}
+		if existing.Block.JustifyView == 0 && block.JustifyView != 0 {
+			existing.Block.JustifyView = block.JustifyView
+		}
+		if len(existing.Block.Tx) == 0 && len(block.Tx) > 0 {
+			existing.Block.Tx = append([]string(nil), block.Tx...)
+		}
+		return
+	}
+	s.hotstuffBlocks[block.BlockID] = &hotstuffBlock{Block: block}
+}
+
+func (s *Service) validateHotStuffProposal(block common.Block, msg common.ConsensusMessage) bool {
+	if common.Digest(msg.View, msg.Height, msg.Tx) != msg.Digest {
+		return false
+	}
+	if block.BlockID == "" || block.ParentBlockID == "" {
+		return false
+	}
+	if _, ok := s.hotstuffBlocks[block.ParentBlockID]; !ok {
+		return false
+	}
+	if block.JustifyBlockID != "" && block.JustifyBlockID != block.ParentBlockID {
+		return false
+	}
+	if s.hotstuffLockedQC.BlockID != "" && s.hotstuffLockedQC.BlockID != "genesis" {
+		if block.JustifyView < s.hotstuffLockedQC.View && !s.extendsHotStuff(block.ParentBlockID, s.hotstuffLockedQC.BlockID) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) extendsHotStuff(blockID, ancestorID string) bool {
+	if ancestorID == "" {
+		return true
+	}
+	cur := blockID
+	for cur != "" {
+		if cur == ancestorID {
+			return true
+		}
+		block, ok := s.hotstuffBlocks[cur]
+		if !ok {
+			return false
+		}
+		cur = block.Block.ParentBlockID
+	}
+	return false
+}
+
+func (s *Service) updateLockedQCFromProposal(block common.Block, msg common.ConsensusMessage) {
+	if msg.JustifyQC == "" || msg.JustifyView < s.hotstuffLockedQC.View {
+		return
+	}
+	qc := common.QuorumCert{
+		Type:    "HSQC",
+		BlockID: block.ParentBlockID,
+		View:    msg.JustifyView,
+		Height:  block.Height - 1,
+		QC:      msg.JustifyQC,
+	}
+	s.hotstuffLockedQC = qc
+	s.persistLockedQC(qc)
+}
+
+func (s *Service) updateHotStuffHighQC(msg common.ConsensusMessage) {
+	blockID := s.messageBlockID(msg)
+	qc := common.QuorumCert{
+		Type:    msg.Type,
+		BlockID: blockID,
+		View:    msg.View,
+		Height:  msg.Height,
+		QC:      msg.QC,
+	}
+	if qc.View <= s.hotstuffHighQC.View {
+		return
+	}
+	if block, ok := s.hotstuffBlocks[blockID]; ok {
+		block.QC = &qc
+	}
+	s.hotstuffHighQC = qc
+}
+
+func (s *Service) commitHotStuffAncestor(blockID string) {
+	block, ok := s.hotstuffBlocks[blockID]
+	if !ok {
+		return
+	}
+	parent, ok := s.hotstuffBlocks[block.Block.ParentBlockID]
+	if !ok {
+		return
+	}
+	grandParent, ok := s.hotstuffBlocks[parent.Block.ParentBlockID]
+	if !ok || grandParent.Block.BlockID == "genesis" {
+		return
+	}
+	if grandParent.Committed {
+		return
+	}
+	grandParent.Committed = true
+	if !grandParent.Executed {
+		s.executeLoad(grandParent.Block.Tx)
+		grandParent.Executed = true
+	}
+	s.persistCommittedBlock(grandParent.Block.BlockID)
+	go s.reportEnd(grandParent.Block.Height)
+}
+
+func (s *Service) loadPersistedPosition() {
+	if s.stores == nil {
+		return
+	}
+	if view, err := s.stores.State.LoadCurrentView(); err == nil && view > 0 {
+		s.view = view
+	} else if err != nil && !errors.Is(err, goleveldb.ErrNotFound) {
+		log.Printf("node=%d load current view: %v", s.selfID, err)
+	}
+	if height, err := s.stores.State.LoadCurrentHeight(); err == nil && height > 0 {
+		s.height = height
+	} else if err != nil && !errors.Is(err, goleveldb.ErrNotFound) {
+		log.Printf("node=%d load current height: %v", s.selfID, err)
+	}
+}
+
+func (s *Service) persistPosition() {
+	if s.stores == nil {
+		return
+	}
+	if err := s.stores.State.SaveCurrentView(s.view); err != nil {
+		log.Printf("node=%d save current view: %v", s.selfID, err)
+	}
+	if err := s.stores.State.SaveCurrentHeight(s.height); err != nil {
+		log.Printf("node=%d save current height: %v", s.selfID, err)
+	}
+}
+
+func (s *Service) persistProposal(msg common.ConsensusMessage) {
+	if s.stores == nil {
+		return
+	}
+	record := storage.BlockRecord{
+		BlockID:       s.messageBlockID(msg),
+		ParentBlockID: msg.ParentID,
+		Alg:           s.alg,
+		MessageType:   msg.Type,
+		Digest:        msg.Digest,
+		View:          msg.View,
+		Height:        msg.Height,
+		From:          msg.From,
+		Tx:            append([]string(nil), msg.Tx...),
+		CreatedAt:     time.Now().UnixNano(),
+	}
+	if err := s.stores.Blocks.SaveBlock(record); err != nil {
+		log.Printf("node=%d save block %s: %v", s.selfID, record.BlockID, err)
+	}
+}
+
+func (s *Service) persistVote(view int, blockID string) {
+	if s.stores == nil {
+		return
+	}
+	if err := s.stores.State.SaveVote(view, blockID); err != nil {
+		log.Printf("node=%d save vote view=%d block=%s: %v", s.selfID, view, blockID, err)
+	}
+}
+
+func (s *Service) persistPrepare(msg common.ConsensusMessage) {
+	if s.stores == nil {
+		return
+	}
+	record := storage.PrepareRecord{
+		Alg:       s.alg,
+		Digest:    msg.Digest,
+		View:      msg.View,
+		Height:    msg.Height,
+		From:      msg.From,
+		SigShare:  msg.SigShare,
+		CreatedAt: time.Now().UnixNano(),
+	}
+	if err := s.stores.State.SavePrepare(record); err != nil {
+		log.Printf("node=%d save prepare height=%d view=%d from=%d: %v", s.selfID, msg.Height, msg.View, msg.From, err)
+	}
+}
+
+func (s *Service) persistQC(msg common.ConsensusMessage) {
+	if s.stores == nil {
+		return
+	}
+	record := storage.QCRecord{
+		BlockID:   s.messageBlockID(msg),
+		Alg:       s.alg,
+		QCType:    msg.Type,
+		Digest:    msg.Digest,
+		View:      msg.View,
+		Height:    msg.Height,
+		From:      msg.From,
+		QC:        msg.QC,
+		CreatedAt: time.Now().UnixNano(),
+	}
+	if err := s.stores.Blocks.SaveQC(record); err != nil {
+		log.Printf("node=%d save qc %s: %v", s.selfID, msg.Digest, err)
+	}
+	if msg.Type == "CommitProof" {
+		if err := s.stores.State.SaveCommitProof(record); err != nil {
+			log.Printf("node=%d save commit proof %s: %v", s.selfID, msg.Digest, err)
+		}
+	}
+}
+
+func (s *Service) persistHighQC(msg common.ConsensusMessage) {
+	if s.stores == nil {
+		return
+	}
+	record := storage.QCRecord{
+		BlockID:   s.messageBlockID(msg),
+		Alg:       s.alg,
+		QCType:    msg.Type,
+		Digest:    msg.Digest,
+		View:      msg.View,
+		Height:    msg.Height,
+		From:      msg.From,
+		QC:        msg.QC,
+		CreatedAt: time.Now().UnixNano(),
+	}
+	if err := s.stores.State.SaveHighQC(record); err != nil {
+		log.Printf("node=%d save high qc %s: %v", s.selfID, msg.Digest, err)
+	}
+}
+
+func (s *Service) persistLockedQC(qc common.QuorumCert) {
+	if s.stores == nil {
+		return
+	}
+	record := storage.QCRecord{
+		BlockID:   qc.BlockID,
+		Alg:       s.alg,
+		QCType:    qc.Type,
+		Digest:    qc.BlockID,
+		View:      qc.View,
+		Height:    qc.Height,
+		From:      s.selfID,
+		QC:        qc.QC,
+		CreatedAt: time.Now().UnixNano(),
+	}
+	if err := s.stores.State.SaveLockedQC(record); err != nil {
+		log.Printf("node=%d save locked qc %s: %v", s.selfID, qc.BlockID, err)
+	}
+}
+
+func (s *Service) persistCommittedBlock(blockID string) {
+	if s.stores == nil {
+		return
+	}
+	if err := s.stores.State.SaveLastCommittedBlock(blockID); err != nil {
+		log.Printf("node=%d save committed block %s: %v", s.selfID, blockID, err)
+	}
+}
+
+// 执行业务负载模拟：对交易集合做简单计算。
 func (s *Service) executeLoad(tx []string) {
 	nums := make([]int, 1001)
 	for i := range nums {
@@ -331,6 +817,7 @@ func (s *Service) executeLoad(tx []string) {
 	}
 }
 
+// 生成模拟交易负载：每个高度 100*height 条。
 func generateTx(height int) []string {
 	sz := height * 100
 	tx := make([]string, 0, sz)
@@ -346,9 +833,10 @@ func generateTx(height int) []string {
 	return tx
 }
 
+// 构建节点 HTTP 路由，只启用当前算法对应的消息入口。
 func BuildMux(enabled string, handler http.HandlerFunc) *http.ServeMux {
 	mux := http.NewServeMux()
-	prefixes := []string{"pbft", "hotstuff", "fast-hotstuff", "hpbft"}
+	prefixes := []string{"sbft", "hotstuff", "fast-hotstuff", "hpbft"}
 	for _, p := range prefixes {
 		path := "/" + p + "/message"
 		if p == enabled {
@@ -361,12 +849,14 @@ func BuildMux(enabled string, handler http.HandlerFunc) *http.ServeMux {
 	return mux
 }
 
+// 启动节点 HTTP 服务并进入共识流程。
 func Run(selfID int, alg string) error {
 	rdb := redisx.NewClient()
 	s, err := New(rdb, selfID, alg)
 	if err != nil {
 		return err
 	}
+	defer s.stores.Close()
 	mux := BuildMux(alg, s.HandleMessage)
 	addr := fmt.Sprintf("127.0.0.1:%d", s.cfg.BasePort+selfID)
 	log.Printf("node=%d alg=%s listen=%s N=%d t=%d q=%d", selfID, alg, addr, s.th.N, s.th.T, s.th.Q)

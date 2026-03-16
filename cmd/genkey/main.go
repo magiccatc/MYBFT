@@ -12,12 +12,14 @@ import (
 	"mybft/internal/redisx"
 )
 
+// 生成演示用密钥材料（非真实安全的门限密钥）。
 func randKey() string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	return base64.StdEncoding.EncodeToString(b)
 }
 
+// 初始化集群配置与节点密钥，写入 Redis 供 node/client 读取。
 func main() {
 	if len(os.Args) != 2 {
 		log.Fatal("usage: genkey N")

@@ -1,0 +1,103 @@
+﻿# MYBFT 开发者说明
+
+本文件面向开发者，描述项目结构、运行方式与关键约定。项目为 Go 语言实现的最小可运行 BFT 共识模拟，支持 `sbft`、`hotstuff`、`fast-hotstuff`、`hpbft` 四种路由/闭环流程。
+
+**组件概览**
+- `genkey`：写入 Redis 的集群配置与节点密钥材料（演示用）。
+- `client`：提供 `/start`、`/end`，在收到 `q=floor(N/3)+1` 个去重 `/end` 后打印时延。
+- `node`：按算法路由处理共识消息，完成一次高度闭环后回调 `/end`。
+
+**目录结构**
+- `cmd/client/main.go`：客户端入口。
+- `cmd/genkey/main.go`：密钥与集群配置生成入口。
+- `cmd/node/main.go`：节点入口。
+- `internal/clientsvc`：`/start` 与 `/end` 实现、去重与时延统计。
+- `internal/nodesvc`：共识流程、网络路由、负载模拟。
+- `internal/common`：消息与阈值计算、摘要与去重键。
+- `internal/crypto`：简化签名与聚合验证逻辑。
+- `internal/redisx`：通过 `redis-cli` 读写 Redis。
+
+**运行前置**
+- Go 已安装且 `go` 在 PATH。
+- Redis 服务端与 `redis-cli` 在 PATH。
+- 默认 Redis 地址 `127.0.0.1:6379`，可用环境变量 `REDIS_ADDR` 覆盖。
+- 端口占用情况：客户端 `127.0.0.1:8000`，节点基准端口 `9000`（实际为 `9000+nodeID`）。
+
+**构建**
+```bash
+go build ./cmd/genkey
+go build ./cmd/client
+go build ./cmd/node
+```
+
+**手动运行（示例 N=4）**
+1. 启动 Redis。
+2. 生成配置与密钥：`go run ./cmd/genkey 4`
+3. 启动客户端：`go run ./cmd/client 4`
+4. 分别启动节点（示例 SBFT）：
+   - `go run ./cmd/node 2 sbft`
+   - `go run ./cmd/node 3 sbft`
+   - `go run ./cmd/node 4 sbft`
+   - `go run ./cmd/node 1 sbft`
+
+**Windows 一键启动脚本**
+- 脚本：`start_cluster.cmd`
+- 用法：
+```bat
+.\start_cluster.cmd sbft 4
+.\start_cluster.cmd hotstuff 7
+.\start_cluster.cmd fast-hotstuff 4
+.\start_cluster.cmd hpbft 10
+```
+- 行为：检测 Redis，必要时自动启动；执行 `genkey`；启动 `client`；为每个 `node` 启动独立终端。
+
+**关键协议与约定**
+- 阈值：`t = floor(2N/3)+1`，`q = floor(N/3)+1`。
+- Leader 选择：
+  - 所有算法按 `view` 轮换：`leader = ((view-1) % N) + 1`。
+- 负载模拟：在 proposal 校验后、投票前执行，`height` 每次递增，交易量为 `height*100`。
+  - 其中 `hotstuff` 已改为提交后执行；`sbft/fast-hotstuff/hpbft` 仍保持原有简化执行位置。
+
+**HTTP 接口**
+- 客户端：
+  - `POST /start`：`{ "height": int, "view": int, "start": int64 }`
+  - `POST /end`：`{ "height": int, "from": int, "view": int, "end": int64 }`
+- 节点：
+  - `POST /sbft/message`
+  - `POST /hotstuff/message`
+  - `POST /fast-hotstuff/message`
+  - `POST /hpbft/message`
+  - `GET /healthz` 返回 `ok`
+- 仅当前启动算法对应的路由生效，其它路由返回 404。
+
+**Redis 数据**
+- `cluster:config`：
+  - `N`：节点数。
+  - `basePort`：节点基准端口，默认 9000。
+  - `clientAddr`：客户端地址，默认 `127.0.0.1:8000`。
+- `Node:<id>`：示例密钥材料（`threshold_sk`、`agg_sk` 等）。
+- 延迟统计：`latency:start`、`latency:end`、`latency:reply`、`latency:dedup:<height>`、`latency:printed`。
+
+**输出与指标**
+- 客户端在每个 `height` 收到 `q` 个去重 `/end` 后打印：
+  - `height %d latency is %f batch is %d throughput is %f tx/s`
+  - `latency` 以秒为单位，计算为 `end-start`（客户端接收时间戳）。
+  - `batch = 100 * height`。
+- `throughput` 为滑动窗口吞吐量，计算方式为“最近 `N` 秒内累计提交交易数 / `N`”，默认 `N=5`。
+- 可通过环境变量 `MYBFT_TPS_WINDOW_SECONDS` 调整吞吐量窗口大小。
+- 吞吐量样本和每个高度的指标会持久化到本地 `LevelDB`，默认路径为 `data/client/metrics/leveldb`。
+- `client` 对 `/start` 按 height 独立幂等记录，支持 `hotstuff` 在流水线下“先 proposal、后延迟 commit”的时序。
+
+**常见问题**
+- Redis 未启动：确认 `redis-server` 在运行，或使用脚本自动启动。
+- 端口占用：修改 Redis 的 `cluster:config` 或停用冲突进程。
+- 算法名错误：仅支持 `sbft | hotstuff | fast-hotstuff | hpbft`。
+- `redis-cli` 不可用：确保 Redis 安装完整且 PATH 正确。
+
+**查看本地指标**
+```bash
+go run ./cmd/metrics
+go run ./cmd/metrics 10
+```
+- 不带参数时，列出本地 `LevelDB` 中全部已保存指标。
+- 带 `height` 参数时，查看指定高度的时延、batch、吞吐量和记录时间。
