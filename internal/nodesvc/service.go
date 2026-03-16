@@ -41,6 +41,14 @@ type hotstuffBlock struct {
 	Executed  bool
 }
 
+type simulatedTx struct {
+	From   int
+	To     int
+	Amount int
+	Nonce  int
+	Fee    int
+}
+
 type Service struct {
 	mu               sync.Mutex
 	rdb              *redisx.Client
@@ -178,7 +186,9 @@ func (s *Service) processSBFT(msg common.ConsensusMessage, hs *heightState) {
 		hs.ProposalDigest = msg.Digest
 		hs.ProposalTx = msg.Tx
 		s.persistProposal(msg)
-		s.executeLoad(msg.Tx)
+		if !s.validateAndExecuteLoad(msg.Tx) {
+			return
+		}
 		m := crypto.VoteMessage("Prepare", msg.View, msg.Height, msg.Digest, s.selfID)
 		sig := crypto.Sign(s.keys[s.selfID], m)
 		s.persistVote(msg.View, msg.Digest)
@@ -244,6 +254,9 @@ func (s *Service) processHotStuff(msg common.ConsensusMessage, hs *heightState) 
 		s.registerHotStuffBlock(block)
 		s.persistProposal(msg)
 		s.updateLockedQCFromProposal(block, msg)
+		if !s.validateAndExecuteLoad(msg.Tx) {
+			return
+		}
 		if votedBlock, ok := s.hotstuffVoted[msg.View]; ok && votedBlock != block.BlockID {
 			return
 		}
@@ -320,7 +333,9 @@ func (s *Service) processOneVote(msg common.ConsensusMessage, hs *heightState, p
 		hs.ProposalDigest = msg.Digest
 		hs.ProposalTx = msg.Tx
 		s.persistProposal(msg)
-		s.executeLoad(msg.Tx)
+		if !s.validateAndExecuteLoad(msg.Tx) {
+			return
+		}
 		m := crypto.VoteMessage(voteType, msg.View, msg.Height, msg.Digest, s.selfID)
 		sig := crypto.Sign(s.keys[s.selfID], m)
 		s.persistVote(msg.View, msg.Digest)
@@ -377,7 +392,7 @@ func (s *Service) proposeCurrentHeight() {
 	s.mu.Unlock()
 	tx := generateTx(height)
 	digest := common.Digest(view, height, tx)
-	s.callStart(height, view)
+	s.callStart(height, view, len(tx))
 	var msg common.ConsensusMessage
 	switch s.alg {
 	case "sbft":
@@ -417,8 +432,8 @@ func (s *Service) proposeCurrentHeight() {
 }
 
 // 向 client 上报 /start（记录延迟起点）。
-func (s *Service) callStart(height, view int) {
-	body, _ := json.Marshal(common.StartRequest{Height: height, View: view, Start: time.Now().UnixNano()})
+func (s *Service) callStart(height, view, batch int) {
+	body, _ := json.Marshal(common.StartRequest{Height: height, View: view, Start: time.Now().UnixNano(), Batch: batch})
 	_, _ = http.Post(s.clientURL+"/start", "application/json", bytes.NewReader(body))
 }
 
@@ -639,7 +654,7 @@ func (s *Service) commitHotStuffAncestor(blockID string) {
 	}
 	grandParent.Committed = true
 	if !grandParent.Executed {
-		s.executeLoad(grandParent.Block.Tx)
+		_ = s.validateAndExecuteLoad(grandParent.Block.Tx)
 		grandParent.Executed = true
 	}
 	s.persistCommittedBlock(grandParent.Block.BlockID)
@@ -796,39 +811,123 @@ func (s *Service) persistCommittedBlock(blockID string) {
 	}
 }
 
-// 执行业务负载模拟：对交易集合做简单计算。
-func (s *Service) executeLoad(tx []string) {
-	nums := make([]int, 1001)
-	for i := range nums {
-		nums[i] = i
+// validateAndExecuteLoad 对批量交易做字段、nonce、余额检查，并执行状态变更模拟。
+func (s *Service) validateAndExecuteLoad(tx []string) bool {
+	const accountCount = 1000
+	const initialBalance = 100000
+
+	balances := make([]int, accountCount+1)
+	nextNonce := make([]int, accountCount+1)
+	for i := 1; i <= accountCount; i++ {
+		balances[i] = initialBalance
 	}
+	seen := make(map[string]struct{}, len(tx))
+	totalFees := 0
+
 	for _, line := range tx {
-		parts := strings.Fields(line)
-		if len(parts) != 3 {
-			continue
+		stx, ok := parseSimulatedTx(line)
+		if !ok {
+			return false
 		}
-		sid, _ := strconv.Atoi(parts[0])
-		rid, _ := strconv.Atoi(parts[1])
-		tn, _ := strconv.Atoi(parts[2])
-		if sid >= 0 && sid < len(nums) && rid >= 0 && rid < len(nums) && sid != rid {
-			nums[sid] += tn
-			nums[rid] -= tn
+		if stx.From < 1 || stx.From > accountCount || stx.To < 1 || stx.To > accountCount || stx.From == stx.To {
+			return false
 		}
+		if stx.Amount <= 0 || stx.Fee < 0 || stx.Nonce <= 0 {
+			return false
+		}
+		dedupKey := fmt.Sprintf("%d:%d", stx.From, stx.Nonce)
+		if _, exists := seen[dedupKey]; exists {
+			return false
+		}
+		seen[dedupKey] = struct{}{}
+		if stx.Nonce != nextNonce[stx.From]+1 {
+			return false
+		}
+		cost := stx.Amount + stx.Fee
+		if balances[stx.From] < cost {
+			return false
+		}
+
+		balances[stx.From] -= cost
+		balances[stx.To] += stx.Amount
+		nextNonce[stx.From] = stx.Nonce
+		totalFees += stx.Fee
 	}
+
+	_ = totalFees
+	return true
 }
 
-// 生成模拟交易负载：每个高度 100*height 条。
+func parseSimulatedTx(line string) (simulatedTx, bool) {
+	parts := strings.Fields(line)
+	if len(parts) != 5 {
+		return simulatedTx{}, false
+	}
+	from, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return simulatedTx{}, false
+	}
+	to, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return simulatedTx{}, false
+	}
+	amount, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return simulatedTx{}, false
+	}
+	nonce, err := strconv.Atoi(parts[3])
+	if err != nil {
+		return simulatedTx{}, false
+	}
+	fee, err := strconv.Atoi(parts[4])
+	if err != nil {
+		return simulatedTx{}, false
+	}
+	return simulatedTx{From: from, To: to, Amount: amount, Nonce: nonce, Fee: fee}, true
+}
+
+// 生成模拟交易负载：每个高度 100*height 条，包含 amount/nonce/fee 以支持更复杂校验。
 func generateTx(height int) []string {
+	const accountCount = 1000
+	const initialBalance = 100000
+
 	sz := height * 100
 	tx := make([]string, 0, sz)
+	balances := make([]int, accountCount+1)
+	nextNonce := make([]int, accountCount+1)
+	for i := 1; i <= accountCount; i++ {
+		balances[i] = initialBalance
+	}
 	for i := 0; i < sz; i++ {
-		a := rand.Intn(1001)
-		b := rand.Intn(1001)
-		for b == a {
-			b = rand.Intn(1001)
+		from := 1 + rand.Intn(accountCount)
+		retries := 0
+		for balances[from] < 2 && retries < accountCount {
+			from = 1 + rand.Intn(accountCount)
+			retries++
 		}
-		n := rand.Intn(10) + 1
-		tx = append(tx, fmt.Sprintf("%d %d %d", a, b, n))
+		to := 1 + rand.Intn(accountCount)
+		for to == from {
+			to = 1 + rand.Intn(accountCount)
+		}
+		maxSpend := balances[from]
+		if maxSpend <= 1 {
+			maxSpend = 2
+		}
+		fee := rand.Intn(3) + 1
+		maxAmount := maxSpend - fee
+		if maxAmount < 1 {
+			maxAmount = 1
+			fee = 0
+		}
+		if maxAmount > 50 {
+			maxAmount = 50
+		}
+		amount := rand.Intn(maxAmount) + 1
+		nonce := nextNonce[from] + 1
+		balances[from] -= amount + fee
+		balances[to] += amount
+		nextNonce[from] = nonce
+		tx = append(tx, fmt.Sprintf("%d %d %d %d %d", from, to, amount, nonce, fee))
 	}
 	return tx
 }

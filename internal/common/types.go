@@ -24,6 +24,7 @@ type StartRequest struct {
 	Height int   `json:"height"`
 	Start  int64 `json:"start"`
 	View   int   `json:"view,omitempty"`
+	Batch  int   `json:"batch,omitempty"`
 }
 
 type EndRequest struct {

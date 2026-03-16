@@ -69,6 +69,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	if ok, _ := s.rdb.HExists("latency:start", h); !ok {
 		s.rdb.HSet("latency:start", map[string]string{h: strconv.FormatInt(now, 10)})
+		s.rdb.HSet("latency:batch", map[string]string{h: strconv.Itoa(req.Batch)})
 		s.rdb.HSet("latency:reply", map[string]string{h: "0"})
 		s.rdb.Del("latency:dedup:" + h)
 		s.rdb.HDel("latency:end", h)
@@ -111,18 +112,14 @@ func (s *Service) handleEnd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	replies, _ := s.rdb.HIncrBy("latency:reply", h, 1)
-	if exists, _ := s.rdb.HExists("latency:end", h); !exists {
-		s.rdb.HSet("latency:end", map[string]string{h: strconv.FormatInt(now, 10)})
-	}
 	log.Printf("ts=%d role=client id=0 event=end_accepted height=%d from=%d reply=%d", now, req.Height, req.From, replies)
 	if int(replies) == s.q {
+		s.rdb.HSet("latency:end", map[string]string{h: strconv.FormatInt(now, 10)})
 		startRaw, _ := s.rdb.HGet("latency:start", h)
-		endRaw, _ := s.rdb.HGet("latency:end", h)
 		start, _ := strconv.ParseInt(startRaw, 10, 64)
-		end, _ := strconv.ParseInt(endRaw, 10, 64)
-		latency := float64(end-start) / 1e9
-		batch := txCountForHeight(req.Height)
-		recordedAt := time.Unix(0, end)
+		latency := float64(now-start) / 1e9
+		batch := txCountForHeight(s.rdb, h, req.Height)
+		recordedAt := time.Unix(0, now)
 		throughput := s.recordThroughputSample(batch, recordedAt)
 		s.persistMetric(req.Height, latency, batch, throughput, recordedAt)
 		fmt.Printf("height %d latency is %f batch is %d throughput is %f tx/s\n", req.Height, latency, batch, throughput)
@@ -131,7 +128,13 @@ func (s *Service) handleEnd(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func txCountForHeight(height int) int {
+func txCountForHeight(rdb *redisx.Client, heightKey string, height int) int {
+	raw, err := rdb.HGet("latency:batch", heightKey)
+	if err == nil {
+		if batch, parseErr := strconv.Atoi(raw); parseErr == nil && batch >= 0 {
+			return batch
+		}
+	}
 	return 100 * height
 }
 
